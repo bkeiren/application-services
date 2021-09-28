@@ -30,6 +30,8 @@ pub struct TargetingAttributes {
     #[serde(flatten)]
     pub app_context: AppContext,
     pub is_already_enrolled: bool,
+    pub days_since_install: Option<i32>,
+    pub days_since_update: Option<i32>,
 }
 
 /// Determine the enrolment status for an experiment.
@@ -238,14 +240,6 @@ mod tests {
     use super::*;
     use crate::{BucketConfig, Experiment, RandomizationUnit};
 
-    impl From<AppContext> for TargetingAttributes {
-        fn from(app_context: AppContext) -> Self {
-            Self {
-                app_context,
-                ..Default::default()
-            }
-        }
-    }
     #[test]
     fn test_targeting() {
         // Here's our valid jexl statement

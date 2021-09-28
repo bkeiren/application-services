@@ -72,7 +72,7 @@ enum NimbusError {
     "TryFromSliceError", "EmptyRatiosError", "OutOfBoundsError","UrlParsingError",
     "RequestError", "ResponseError", "UuidError", "InvalidExperimentFormat",
     "InvalidPath", "InternalError", "NoSuchExperiment", "NoSuchBranch", "BackoffError",
-    "DatabaseNotReady",
+    "DatabaseNotReady", "DateTimeError"
 };
 
 interface NimbusClient {
