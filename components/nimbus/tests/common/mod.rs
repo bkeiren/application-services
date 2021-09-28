@@ -18,6 +18,16 @@ pub fn new_test_client_with_db(tmp_dir: &tempdir::TempDir) -> Result<NimbusClien
     new_test_client_internal(tmp_dir)
 }
 
+#[allow(dead_code)]
+pub fn new_app_context() -> AppContext {
+    AppContext {
+        app_name: "fenix".to_string(),
+        app_id: "org.mozilla.fenix".to_string(),
+        channel: "nightly".to_string(),
+        ..Default::default()
+    }
+}
+
 fn new_test_client_internal(
     tmp_dir: &tempdir::TempDir,
 ) -> Result<NimbusClient, nimbus::NimbusError> {
@@ -33,12 +43,7 @@ fn new_test_client_internal(
         collection_name: "doesn't matter".to_string(),
     };
     let aru = Default::default();
-    let ctx = AppContext {
-        app_name: "fenix".to_string(),
-        app_id: "org.mozilla.fenix".to_string(),
-        channel: "nightly".to_string(),
-        ..Default::default()
-    };
+    let ctx = new_app_context();
     NimbusClient::new(ctx, tmp_dir.path(), Some(config), aru)
 }
 

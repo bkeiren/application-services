@@ -40,9 +40,9 @@ use once_cell::sync::OnceCell;
 use persistence::{Database, StoreId, Writer};
 use serde_derive::*;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::{collections::HashSet, path::Path};
 use updating::{read_and_remove_pending_experiments, write_pending_experiments};
 use uuid::Uuid;
 
@@ -108,6 +108,21 @@ impl NimbusClient {
             db_path: db_path.into(),
             db: OnceCell::default(),
         })
+    }
+
+    // ONLY USED BY INTEGRATION TESTS
+    // This should be protected with
+    // #[cfg(test)], but the attribute
+    // does not work on integration tests
+    pub fn with_targeting_attributes(&mut self, targeting_attributes: TargetingAttributes) {
+        let mut state = self.mutable_state.lock().unwrap();
+        state.targeting_attributes = targeting_attributes;
+    }
+
+    #[cfg(test)]
+    pub fn get_targeting_attributes(&self) -> TargetingAttributes {
+        let state = self.mutable_state.lock().unwrap();
+        state.targeting_attributes.clone()
     }
 
     pub fn initialize(&self) -> Result<()> {
@@ -228,8 +243,11 @@ impl NimbusClient {
         log::info!("updating experiment list");
         // If the application did not pass in an installation date,
         // we check if we already persisted one on a previous run:
-        let installation_date = self.get_installation_date()?;
-        let update_date = self.get_update_date()?;
+        let db = self.db()?;
+        let mut writer = db.write()?;
+
+        let installation_date = self.get_installation_date(db, &mut writer)?;
+        let update_date = self.get_update_date(db, &mut writer)?;
         let now = Utc::now();
         let days_since_install = now - installation_date;
         let days_since_update = now - update_date;
@@ -243,10 +261,8 @@ impl NimbusClient {
                 Some(days_since_update.num_days() as i32);
         }
 
-        let db = self.db()?;
-        let mut writer = db.write()?;
         let pending_updates = read_and_remove_pending_experiments(db, &mut writer)?;
-        Ok(match pending_updates {
+        let res = match pending_updates {
             Some(new_experiments) => {
                 let nimbus_id = self.read_or_create_nimbus_id(db, &mut writer)?;
                 let evolver = EnrollmentsEvolver::new(
@@ -254,76 +270,80 @@ impl NimbusClient {
                     &state.available_randomization_units,
                     &state.targeting_attributes,
                 );
-                let events = evolver.evolve_enrollments_in_db(db, &mut writer, &new_experiments)?;
-                self.database_cache.commit_and_update(db, writer)?;
-                events
+                evolver.evolve_enrollments_in_db(db, &mut writer, &new_experiments)?
             }
-            // We don't need to writer.commit() here because we haven't done anything.
             None => vec![],
-        })
+        };
+        self.database_cache.commit_and_update(db, writer)?;
+        Ok(res)
     }
 
-    fn get_installation_date(&self) -> Result<DateTime<Utc>> {
-        let db = self.db()?;
-        let mut writer = db.write()?;
+    fn get_installation_date(&self, db: &Database, writer: &mut Writer) -> Result<DateTime<Utc>> {
         let store = db.get_store(StoreId::Meta);
-
         let persisted_installation_date: Option<DateTime<Utc>> =
-            store.get(&writer, DB_KEY_INSTALLATION_DATE)?;
-        Ok(
-            if let Some(installation_date) = persisted_installation_date {
-                installation_date
-            } else {
-                let installation_date = match self.get_creation_date_from_path(&self.db_path) {
-                    Ok(installation_date) => installation_date,
-                    Err(_) => Utc::now(),
-                };
-                let store = db.get_store(StoreId::Meta);
-                store.put(&mut writer, DB_KEY_INSTALLATION_DATE, &installation_date)?;
-                installation_date
-            },
-        )
+            store.get(writer, DB_KEY_INSTALLATION_DATE)?;
+        let res = if let Some(installation_date) = persisted_installation_date {
+            installation_date
+        } else {
+            let installation_date = match self.get_creation_date_from_path(&self.db_path) {
+                Ok(installation_date) => installation_date,
+                Err(_) => Utc::now(),
+            };
+            let store = db.get_store(StoreId::Meta);
+            store.put(writer, DB_KEY_INSTALLATION_DATE, &installation_date)?;
+            installation_date
+        };
+        Ok(res)
     }
 
-    fn get_update_date(&self) -> Result<DateTime<Utc>> {
-        let db = self.db()?;
-        let mut writer = db.write()?;
+    fn get_update_date(&self, db: &Database, writer: &mut Writer) -> Result<DateTime<Utc>> {
         let store = db.get_store(StoreId::Meta);
 
-        let persisted_app_version: Option<String> = store.get(&writer, DB_KEY_APP_VERSION)?;
-        Ok(
-            match (persisted_app_version, &self.app_context.app_version) {
-                (persisted_app_version, Some(current_app_version))
-                    if (persisted_app_version.is_some()
-                        && persisted_app_version.clone().unwrap() != *current_app_version)
-                        || persisted_app_version.is_none() =>
-                {
-                    store.put(&mut writer, DB_KEY_APP_VERSION, current_app_version)?;
+        let persisted_app_version: Option<String> = store.get(writer, DB_KEY_APP_VERSION)?;
+        let res = match (persisted_app_version, &self.app_context.app_version) {
+            (persisted_app_version, Some(current_app_version))
+                if (persisted_app_version.is_some()
+                    && persisted_app_version.clone().unwrap() != *current_app_version)
+                    || persisted_app_version.is_none() =>
+            {
+                store.put(writer, DB_KEY_APP_VERSION, current_app_version)?;
+                let update_date = Utc::now();
+                store.put(writer, DB_KEY_UPDATE_DATE, &update_date)?;
+                update_date
+            }
+            _ => {
+                let update_date: Option<DateTime<Utc>> = store.get(writer, DB_KEY_UPDATE_DATE)?;
+                if let Some(update_date) = update_date {
+                    update_date
+                } else {
                     let update_date = Utc::now();
-                    store.put(&mut writer, DB_KEY_UPDATE_DATE, &update_date)?;
+                    store.put(writer, DB_KEY_UPDATE_DATE, &update_date)?;
                     update_date
                 }
-                _ => {
-                    let update_date: Option<DateTime<Utc>> =
-                        store.get(&writer, DB_KEY_UPDATE_DATE)?;
-                    if let Some(update_date) = update_date {
-                        update_date
-                    } else {
-                        let update_date = Utc::now();
-                        store.put(&mut writer, DB_KEY_UPDATE_DATE, &update_date)?;
-                        update_date
-                    }
-                }
-            },
-        )
+            }
+        };
+        Ok(res)
     }
 
+    #[cfg(not(test))]
     fn get_creation_date_from_path<P: AsRef<Path>>(&self, path: P) -> Result<DateTime<Utc>> {
         let file = std::fs::File::open(path)?;
         let metadata = file.metadata()?;
         let system_time_created = metadata.created()?;
         let date_time_created = DateTime::<Utc>::from(system_time_created);
         Ok(date_time_created)
+    }
+
+    #[cfg(test)]
+    fn get_creation_date_from_path<P: AsRef<Path>>(&self, path: P) -> Result<DateTime<Utc>> {
+        use std::io::Read;
+        let test_path = path.as_ref().with_file_name("test.json");
+        let mut file = std::fs::File::open(test_path)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+
+        let res = serde_json::from_str::<DateTime<Utc>>(&buf)?;
+        Ok(res)
     }
 
     pub fn set_experiments_locally(&self, experiments_json: String) -> Result<()> {
@@ -621,6 +641,8 @@ include!(concat!(env!("OUT_DIR"), "/nimbus.uniffi.rs"));
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use enrollment::{EnrolledReason, EnrollmentStatus, ExperimentEnrollment};
     use tempdir::TempDir;
@@ -693,6 +715,96 @@ mod tests {
         // We should have returned a single event.
         assert_eq!(events.len(), 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_creation_date_from_fs() -> Result<()> {
+        let mock_client_id = "client-1".to_string();
+        use chrono::Duration;
+        let tmp_dir = TempDir::new("test_telemetry_reset")?;
+        let client = NimbusClient::new(
+            AppContext::default(),
+            tmp_dir.path(),
+            None,
+            AvailableRandomizationUnits {
+                client_id: Some(mock_client_id.clone()),
+                ..AvailableRandomizationUnits::default()
+            },
+        )?;
+        // We store a today's date, this will mock the retrieval
+        // of a date using our fallback strategy. In the tests, the fallback
+        // retrieves a values that's we can modify using `set_test_create_date`
+        // in non-test code, we will be checking the actual creation_date of the
+        // directory
+        set_test_creation_date(Utc::now(), tmp_dir.path())?;
+
+        client.initialize()?;
+        client.apply_pending_experiments()?;
+
+        let targeting_attributes = client.get_targeting_attributes();
+        assert!(matches!(targeting_attributes.days_since_install, Some(0)));
+
+        // We recreate our client to make sure
+        // we wipe any non-persistent memory
+        let client = NimbusClient::new(
+            AppContext::default(),
+            tmp_dir.path(),
+            None,
+            AvailableRandomizationUnits {
+                client_id: Some(mock_client_id.clone()),
+                ..AvailableRandomizationUnits::default()
+            },
+        )?;
+        client.initialize()?;
+
+        // We now store a date for days ago in our file system
+        // this shouldn't change the installation date for the nimbus client
+        // since client already persisted the date seen earlier.
+        let four_days_ago = Utc::now() - Duration::days(4);
+        set_test_creation_date(four_days_ago, tmp_dir.path())?;
+        client.apply_pending_experiments()?;
+        let targeting_attributes = client.get_targeting_attributes();
+        // We will **STILL** get a 0 `days_since_install` since we persisted the value
+        // we got on the previous run, therefore we did not check the file system.
+        assert!(matches!(targeting_attributes.days_since_install, Some(0)));
+
+        // We now clear the persisted storage
+        let db = client.db()?;
+        let mut writer = db.write()?;
+        let store = db.get_store(StoreId::Meta);
+
+        store.clear(&mut writer)?;
+        writer.commit()?;
+
+        let client = NimbusClient::new(
+            AppContext::default(),
+            tmp_dir.path(),
+            None,
+            AvailableRandomizationUnits {
+                client_id: Some(mock_client_id),
+                ..AvailableRandomizationUnits::default()
+            },
+        )?;
+        client.initialize()?;
+        // now that the store is clear, we will fallback again to the
+        // file system, and retrieve the four_days_ago number we stored earlier
+        client.apply_pending_experiments()?;
+        let targeting_attributes = client.get_targeting_attributes();
+        assert!(matches!(targeting_attributes.days_since_install, Some(4)));
+        Ok(())
+    }
+
+    fn set_test_creation_date<P: AsRef<Path>>(date: DateTime<Utc>, path: P) -> Result<()> {
+        use std::fs::OpenOptions;
+        let test_path = path.as_ref().with_file_name("test.json");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(test_path)
+            .unwrap();
+        file.write_all(serde_json::to_string(&date).unwrap().as_bytes())?;
         Ok(())
     }
 }
